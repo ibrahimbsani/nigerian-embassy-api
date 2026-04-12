@@ -1,0 +1,333 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Country {
+  jordan
+  iraq
+}
+
+enum ApplicationStatus {
+  submitted
+  pending_review
+  in_progress
+  requires_action
+  approved
+  ready
+  completed
+  cancelled
+}
+
+enum AppointmentStatus {
+  scheduled
+  confirmed
+  completed
+  cancelled
+  rescheduled
+}
+
+enum TicketStatus {
+  open
+  in_progress
+  resolved
+  closed
+}
+
+enum MessageSender {
+  citizen
+  officer
+  bot
+}
+
+enum NewsCategory {
+  announcement
+  travel_warning
+  security_alert
+  holiday_notice
+  office_closure
+  trade_update
+  general
+}
+
+enum NewsPriority {
+  low
+  normal
+  high
+  urgent
+}
+
+enum AlertStatus {
+  sent
+  acknowledged
+  resolved
+}
+
+enum StaffRole {
+  admin
+  consular_officer
+  duty_officer
+  trade_officer
+  support_officer
+}
+
+model Citizen {
+  id                 String   @id @default(uuid())
+  passportNumber     String   @unique
+  nin                String?  @unique
+  firstName          String
+  lastName           String
+  middleName         String?
+  dateOfBirth        String
+  gender             String
+  email              String   @unique
+  phoneNumber        String
+  countryOfResidence Country
+  cityOfResidence    String   @default("")
+  stateOfOrigin      String   @default("")
+  lgaOfOrigin        String   @default("")
+  preferredLanguage  String   @default("en")
+  profilePhotoUrl    String?
+  isVerified         Boolean  @default(false)
+  isActive           Boolean  @default(true)
+  pinHash            String
+  fcmToken           String?
+
+  nextOfKin          NextOfKin?
+  passportDetails    PassportDetails?
+  applications       Application[]
+  appointments       Appointment[]
+  distressAlerts     DistressAlert[]
+  supportTickets     SupportTicket[]
+  notifPrefs         NotificationPreference?
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([passportNumber])
+  @@index([email])
+  @@index([countryOfResidence])
+}
+
+model NextOfKin {
+  id           String  @id @default(uuid())
+  citizenId    String  @unique
+  citizen      Citizen @relation(fields: [citizenId], references: [id], onDelete: Cascade)
+  name         String
+  relationship String
+  phoneNumber  String
+  email        String?
+  address      String?
+}
+
+model PassportDetails {
+  id               String   @id @default(uuid())
+  citizenId        String   @unique
+  citizen          Citizen  @relation(fields: [citizenId], references: [id], onDelete: Cascade)
+  passportNumber   String
+  issueDate        String
+  expiryDate       String
+  issuingAuthority String
+  placeOfIssue     String
+}
+
+model Application {
+  id                      String            @id @default(uuid())
+  referenceNumber         String            @unique
+  citizenId               String
+  citizen                 Citizen           @relation(fields: [citizenId], references: [id])
+  serviceType             String
+  serviceLabel            String
+  status                  ApplicationStatus @default(submitted)
+  country                 Country
+  formData                Json              @default("{}")
+  requiresAction          String?
+  estimatedCompletionDate String?
+  handledByOfficerId      String?
+  notes                   String?
+
+  documents   ApplicationDocument[]
+  events      ApplicationEvent[]
+  appointment Appointment?
+
+  submittedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([citizenId])
+  @@index([status])
+  @@index([country])
+}
+
+model ApplicationDocument {
+  id            String      @id @default(uuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  docType       String
+  name          String
+  s3Key         String
+  mimeType      String
+  sizeBytes     Int
+  uploadedAt    DateTime    @default(now())
+}
+
+model ApplicationEvent {
+  id            String            @id @default(uuid())
+  applicationId String
+  application   Application       @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  status        ApplicationStatus
+  message       String
+  actor         String
+  actorId       String?
+  timestamp     DateTime          @default(now())
+}
+
+model Appointment {
+  id              String            @id @default(uuid())
+  referenceNumber String            @unique
+  citizenId       String
+  citizen         Citizen           @relation(fields: [citizenId], references: [id])
+  applicationId   String?           @unique
+  application     Application?      @relation(fields: [applicationId], references: [id])
+  serviceType     String
+  serviceLabel    String
+  country         Country
+  scheduledDate   DateTime
+  scheduledTime   String
+  duration        Int               @default(30)
+  status          AppointmentStatus @default(scheduled)
+  notes           String?
+  location        String            @default("Nigerian Embassy, 5th Circle, Amman")
+  reminderSent    Boolean           @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([citizenId])
+  @@index([scheduledDate])
+}
+
+model DistressAlert {
+  id            String      @id @default(uuid())
+  citizenId     String
+  citizen       Citizen     @relation(fields: [citizenId], references: [id])
+  categoryId    String
+  categoryLabel String
+  country       Country
+  latitude      Float?
+  longitude     Float?
+  accuracy      Float?
+  address       String?
+  status        AlertStatus @default(sent)
+  smsSent       Boolean     @default(false)
+  acknowledgedBy String?
+  resolvedAt    DateTime?
+  notes         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([country])
+}
+
+model SupportTicket {
+  id           String       @id @default(uuid())
+  ticketNumber String       @unique
+  citizenId    String
+  citizen      Citizen      @relation(fields: [citizenId], references: [id])
+  subject      String
+  category     String
+  status       TicketStatus @default(open)
+  country      Country
+  assignedToId String?
+
+  messages TicketMessage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([citizenId])
+  @@index([status])
+}
+
+model TicketMessage {
+  id         String        @id @default(uuid())
+  ticketId   String
+  ticket     SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  sender     MessageSender
+  senderName String
+  senderId   String?
+  content    String
+  isRead     Boolean       @default(false)
+  timestamp  DateTime      @default(now())
+}
+
+model NewsItem {
+  id            String       @id @default(uuid())
+  title         String
+  body          String
+  category      NewsCategory
+  country       String
+  priority      NewsPriority @default(normal)
+  publishedAt   DateTime     @default(now())
+  expiresAt     DateTime?
+  imageUrl      String?
+  attachmentUrl String?
+  publishedById String
+  isActive      Boolean      @default(true)
+
+  @@index([country])
+  @@index([category])
+  @@index([publishedAt])
+}
+
+model EmbassyStaff {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  name         String
+  role         StaffRole
+  passwordHash String
+  isActive     Boolean   @default(true)
+  country      Country?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model NotificationPreference {
+  id                   String  @id @default(uuid())
+  citizenId            String  @unique
+  citizen              Citizen @relation(fields: [citizenId], references: [id], onDelete: Cascade)
+  announcements        Boolean @default(true)
+  travelWarnings       Boolean @default(true)
+  securityAlerts       Boolean @default(true)
+  officeClosures       Boolean @default(true)
+  applicationUpdates   Boolean @default(true)
+  appointmentReminders Boolean @default(true)
+  tradeUpdates         Boolean @default(false)
+}
+
+model OtpRecord {
+  id          String   @id @default(uuid())
+  phoneNumber String
+  otpHash     String
+  expiresAt   DateTime
+  used        Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([phoneNumber])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  citizenId String
+  tokenHash String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([citizenId])
+}
