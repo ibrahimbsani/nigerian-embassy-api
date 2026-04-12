@@ -1,6 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// All remaining modules in one file for brevity
-// Each exports its Module class
+// All remaining modules — fixed import paths
+// all-modules.ts is at src/modules/ so:
+//   common/ = ../common/
+//   notifications = ./notifications/notifications.module
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Module } from '@nestjs/common';
@@ -11,19 +13,132 @@ import {
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { PrismaService } from '../../common/prisma.service';
-import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { NotificationsService } from '../notifications/notifications.service';
+import { PrismaService } from '../common/prisma.service';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { NotificationsService } from './notifications/notifications.module';
+import { NotificationsModule } from './notifications/notifications.module';
 import Anthropic from '@anthropic-ai/sdk';
 import * as Twilio from 'twilio';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
 // ─────────────────────────────────────────────────────────────────────────────
+// APPLICATIONS MODULE
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SERVICE_PROCESSING_DAYS: Record<string, number> = {
+  passport_renewal: 21,
+  passport_new: 30,
+  birth_certificate: 14,
+  marriage_certificate: 14,
+  death_certificate: 7,
+  notarization: 5,
+  certificate_of_life: 3,
+  document_attestation: 7,
+};
+
+@Injectable()
+class ApplicationsService {
+  private readonly logger = new Logger(ApplicationsService.name);
+  constructor(private prisma: PrismaService, private notifications: NotificationsService) {}
+
+  async create(citizenId: string, dto: any) {
+    const refNumber = `NE-${(dto.country ?? 'JO').toUpperCase()}-${Date.now().toString(36).toUpperCase()}`;
+    const processingDays = SERVICE_PROCESSING_DAYS[dto.serviceType] ?? 14;
+    const estimatedDate = new Date();
+    estimatedDate.setDate(estimatedDate.getDate() + processingDays);
+
+    const application = await this.prisma.application.create({
+      data: {
+        id: uuidv4(),
+        referenceNumber: refNumber,
+        citizenId,
+        serviceType: dto.serviceType,
+        serviceLabel: dto.serviceLabel,
+        country: dto.country,
+        formData: dto.formData ?? {},
+        estimatedCompletionDate: estimatedDate.toISOString().split('T')[0],
+        events: {
+          create: [{ id: uuidv4(), status: 'submitted', message: `Application submitted. Ref: ${refNumber}`, actor: 'system' }],
+        },
+      },
+      include: { events: true, documents: true },
+    });
+
+    const citizen = await this.prisma.citizen.findUnique({ where: { id: citizenId }, select: { fcmToken: true } });
+    if (citizen?.fcmToken) {
+      await this.notifications.sendToDevice(citizen.fcmToken, { title: '📋 Application Submitted', body: `${dto.serviceLabel} — Ref: ${refNumber}` });
+    }
+    this.logger.log(`Application created: ${refNumber}`);
+    return application;
+  }
+
+  async findByCitizen(citizenId: string) {
+    return this.prisma.application.findMany({
+      where: { citizenId },
+      include: { events: { orderBy: { timestamp: 'asc' } }, documents: true },
+      orderBy: { submittedAt: 'desc' },
+    });
+  }
+
+  async findOne(id: string, citizenId: string) {
+    return this.prisma.application.findFirst({
+      where: { id, citizenId },
+      include: { events: { orderBy: { timestamp: 'asc' } }, documents: true },
+    });
+  }
+
+  async getPresignedUploadUrl(applicationId: string, fileName: string, mimeType: string, docType: string) {
+    const s3Key = `applications/${applicationId}/${docType}/${uuidv4()}-${fileName}`;
+    const documentId = uuidv4();
+    await this.prisma.applicationDocument.create({
+      data: { id: documentId, applicationId, docType, name: fileName, s3Key, mimeType, sizeBytes: 0 },
+    });
+    return { uploadUrl: `https://placeholder-s3/${s3Key}`, documentId, s3Key };
+  }
+}
+
+@ApiTags('Applications')
+@ApiBearerAuth()
+@UseGuards(JwtAuthGuard)
+@Controller('applications')
+class ApplicationsController {
+  constructor(private service: ApplicationsService) {}
+
+  @Post()
+  async create(@Request() req: any, @Body() dto: any) {
+    return { success: true, data: await this.service.create(req.user.id, dto) };
+  }
+
+  @Get()
+  async findAll(@Request() req: any) {
+    return { success: true, data: await this.service.findByCitizen(req.user.id) };
+  }
+
+  @Get(':id')
+  async findOne(@Request() req: any, @Param('id') id: string) {
+    return { success: true, data: await this.service.findOne(id, req.user.id) };
+  }
+
+  @Post('documents/presign')
+  async presign(@Body() body: any) {
+    return { success: true, data: await this.service.getPresignedUploadUrl(body.applicationId, body.fileName, body.mimeType, body.docType) };
+  }
+
+  @Post('documents/:id/confirm')
+  async confirmUpload(@Param('id') id: string) {
+    return { success: true, data: { id, confirmed: true } };
+  }
+}
+
+@Module({ imports: [NotificationsModule], controllers: [ApplicationsController], providers: [ApplicationsService, PrismaService], exports: [ApplicationsService] })
+export class ApplicationsModule {}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DISTRESS MODULE
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DUTY_NUMBERS = {
+const DUTY_NUMBERS: Record<string, string> = {
   jordan: process.env.DUTY_OFFICER_JORDAN ?? '+962777770001',
   iraq:   process.env.DUTY_OFFICER_IRAQ   ?? '+962777770002',
 };
@@ -31,12 +146,14 @@ const DUTY_NUMBERS = {
 @Injectable()
 class DistressService {
   private readonly logger = new Logger(DistressService.name);
-  private twilio: Twilio.Twilio;
+  private twilio: any;
 
   constructor(private prisma: PrismaService, private config: ConfigService, private notifications: NotificationsService) {
     const sid = this.config.get('TWILIO_ACCOUNT_SID');
     const token = this.config.get('TWILIO_AUTH_TOKEN');
-    if (sid && token) this.twilio = (Twilio as any)(sid, token);
+    if (sid && token) {
+      try { this.twilio = (Twilio as any)(sid, token); } catch {}
+    }
   }
 
   async sendAlert(dto: any) {
@@ -62,24 +179,9 @@ class DistressService {
     let smsSent = false;
     if (this.twilio) {
       try {
-        const locationText = dto.latitude
-          ? `GPS: ${dto.latitude.toFixed(5)},${dto.longitude.toFixed(5)}${dto.address ? ` (${dto.address})` : ''}`
-          : 'Location: Not available';
-        const body = [
-          `🚨 DISTRESS ALERT — NigerianEmbassy`,
-          `Citizen: ${citizen.firstName} ${citizen.lastName}`,
-          `Passport: ${citizen.passportNumber}`,
-          `Phone: ${citizen.phoneNumber}`,
-          `Country: ${dto.country?.toUpperCase()}`,
-          `Emergency: ${dto.categoryLabel}`,
-          locationText,
-          `Alert ID: ${alert.id.slice(0, 8).toUpperCase()}`,
-        ].join('\n');
-        await this.twilio.messages.create({
-          body,
-          from: this.config.get('TWILIO_FROM_NUMBER'),
-          to: DUTY_NUMBERS[dto.country as 'jordan' | 'iraq'],
-        });
+        const locationText = dto.latitude ? `GPS: ${dto.latitude.toFixed(5)},${dto.longitude.toFixed(5)}` : 'Location: Not available';
+        const body = [`🚨 DISTRESS ALERT`, `Citizen: ${citizen.firstName} ${citizen.lastName}`, `Passport: ${citizen.passportNumber}`, `Phone: ${citizen.phoneNumber}`, `Country: ${(dto.country ?? '').toUpperCase()}`, `Emergency: ${dto.categoryLabel}`, locationText, `Alert ID: ${alert.id.slice(0, 8).toUpperCase()}`].join('\n');
+        await this.twilio.messages.create({ body, from: this.config.get('TWILIO_FROM_NUMBER'), to: DUTY_NUMBERS[dto.country] ?? DUTY_NUMBERS.jordan });
         smsSent = true;
       } catch (err) {
         this.logger.error(`SMS failed: ${err.message}`);
@@ -88,10 +190,7 @@ class DistressService {
 
     await this.prisma.distressAlert.update({ where: { id: alert.id }, data: { smsSent } });
     await this.notifications.notifyStaff({ title: '🚨 DISTRESS ALERT', body: `${citizen.firstName} ${citizen.lastName} — ${dto.categoryLabel}`, data: { type: 'distress_alert', alertId: alert.id } });
-
-    if (citizen.fcmToken) {
-      await this.notifications.sendToDevice(citizen.fcmToken, { title: 'Alert Sent', body: 'The duty officer has been notified. Stay safe.' });
-    }
+    if (citizen.fcmToken) await this.notifications.sendToDevice(citizen.fcmToken, { title: 'Alert Sent', body: 'The duty officer has been notified. Stay safe.' });
 
     return { id: alert.id, smsSent, status: 'sent' };
   }
@@ -115,37 +214,28 @@ class DistressService {
 
 @ApiTags('Distress')
 @Controller('distress')
-export class DistressController {
+class DistressController {
   constructor(private service: DistressService) {}
 
   @Post('alert')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.CREATED)
-  async sendAlert(@Body() dto: any) {
-    const data = await this.service.sendAlert(dto);
-    return { success: true, data };
-  }
+  async sendAlert(@Body() dto: any) { return { success: true, data: await this.service.sendAlert(dto) }; }
 
   @Get('active')
   @UseGuards(JwtAuthGuard)
-  async getActive() {
-    return { success: true, data: await this.service.getActive() };
-  }
+  async getActive() { return { success: true, data: await this.service.getActive() }; }
 
   @Post(':id/acknowledge')
   @UseGuards(JwtAuthGuard)
-  async acknowledge(@Param('id') id: string, @Request() req: any) {
-    return { success: true, data: await this.service.acknowledge(id, req.user.id) };
-  }
+  async acknowledge(@Param('id') id: string, @Request() req: any) { return { success: true, data: await this.service.acknowledge(id, req.user.id) }; }
 
   @Post(':id/resolve')
   @UseGuards(JwtAuthGuard)
-  async resolve(@Param('id') id: string) {
-    return { success: true, data: await this.service.resolve(id) };
-  }
+  async resolve(@Param('id') id: string) { return { success: true, data: await this.service.resolve(id) }; }
 }
 
-@Module({ imports: [], controllers: [DistressController], providers: [DistressService, PrismaService], exports: [DistressService] })
+@Module({ imports: [NotificationsModule], controllers: [DistressController], providers: [DistressService, PrismaService], exports: [DistressService] })
 export class DistressModule {}
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -163,44 +253,33 @@ class SupportService {
   }
 
   async chat(messages: any[], systemPrompt: string) {
-    if (!this.anthropic) return { content: "I'm temporarily unavailable. Please use 'Send a Message' to contact us." };
+    if (!this.anthropic) return { content: "I'm temporarily unavailable. Please send us a message directly." };
     try {
-      const response = await this.anthropic.messages.create({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages,
-      });
-      const content = response.content.filter(b => b.type === 'text').map(b => (b as any).text).join('');
+      const response = await this.anthropic.messages.create({ model: 'claude-sonnet-4-5', max_tokens: 1024, system: systemPrompt, messages });
+      const content = response.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('');
       return { content };
     } catch (err) {
       this.logger.error(`Claude API error: ${err.message}`);
-      return { content: "I'm having trouble connecting. Please try again or send us a message directly." };
+      return { content: "I'm having trouble connecting. Please try again shortly." };
     }
   }
 
   async createTicket(citizenId: string, dto: any) {
     const ticketNumber = `NE-${Date.now().toString(36).toUpperCase()}`;
     const citizen = await this.prisma.citizen.findUnique({ where: { id: citizenId } });
-
     const ticket = await this.prisma.supportTicket.create({
       data: {
-        id: uuidv4(),
-        ticketNumber,
-        citizenId,
+        id: uuidv4(), ticketNumber, citizenId,
         subject: dto.subject ?? 'Chat inquiry',
         category: dto.category ?? 'general',
         status: 'open',
         country: citizen?.countryOfResidence ?? 'jordan',
-        messages: dto.transcript ? {
-          create: [{ id: uuidv4(), sender: 'citizen', senderName: `${citizen?.firstName} ${citizen?.lastName}`, content: dto.transcript }]
-        } : dto.message ? {
-          create: [{ id: uuidv4(), sender: 'citizen', senderName: `${citizen?.firstName} ${citizen?.lastName}`, content: dto.message }]
-        } : undefined,
+        ...(dto.transcript || dto.message ? {
+          messages: { create: [{ id: uuidv4(), sender: 'citizen', senderName: `${citizen?.firstName ?? ''} ${citizen?.lastName ?? ''}`.trim(), content: dto.transcript ?? dto.message }] }
+        } : {}),
       },
     });
-
-    await this.notifications.notifyStaff({ title: '💬 New Ticket', body: `${ticketNumber}: ${dto.subject}`, data: { type: 'new_ticket', ticketId: ticket.id } });
+    await this.notifications.notifyStaff({ title: '💬 New Ticket', body: `${ticketNumber}: ${dto.subject ?? 'Chat inquiry'}`, data: { type: 'new_ticket', ticketId: ticket.id } });
     return { ticketNumber: ticket.ticketNumber, id: ticket.id };
   }
 
@@ -211,45 +290,28 @@ class SupportService {
       orderBy: { updatedAt: 'desc' },
     });
   }
-
-  async getTicketMessages(ticketId: string) {
-    return this.prisma.ticketMessage.findMany({ where: { ticketId }, orderBy: { timestamp: 'asc' } });
-  }
 }
 
 @ApiTags('Support')
 @UseGuards(JwtAuthGuard)
 @ApiBearerAuth()
 @Controller('support')
-export class SupportController {
+class SupportController {
   constructor(private service: SupportService) {}
 
   @Post('chat')
   @HttpCode(HttpStatus.OK)
-  async chat(@Body() body: any) {
-    const data = await this.service.chat(body.messages, body.systemPrompt);
-    return { success: true, data };
-  }
+  async chat(@Body() body: any) { return { success: true, data: await this.service.chat(body.messages, body.systemPrompt) }; }
 
   @Post('tickets')
   @HttpCode(HttpStatus.CREATED)
-  async createTicket(@Request() req: any, @Body() dto: any) {
-    const data = await this.service.createTicket(req.user.id, dto);
-    return { success: true, data };
-  }
+  async createTicket(@Request() req: any, @Body() dto: any) { return { success: true, data: await this.service.createTicket(req.user.id, dto) }; }
 
   @Get('tickets')
-  async getTickets(@Request() req: any) {
-    return { success: true, data: await this.service.getTickets(req.user.id) };
-  }
-
-  @Get('tickets/:id/messages')
-  async getMessages(@Param('id') id: string) {
-    return { success: true, data: await this.service.getTicketMessages(id) };
-  }
+  async getTickets(@Request() req: any) { return { success: true, data: await this.service.getTickets(req.user.id) }; }
 }
 
-@Module({ imports: [], controllers: [SupportController], providers: [SupportService, PrismaService], exports: [SupportService] })
+@Module({ imports: [NotificationsModule], controllers: [SupportController], providers: [SupportService, PrismaService], exports: [SupportService] })
 export class SupportModule {}
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,16 +320,13 @@ export class SupportModule {}
 
 @ApiTags('News')
 @Controller('news')
-export class NewsController {
+class NewsController {
   constructor(private prisma: PrismaService) {}
 
   @Get()
   async findAll(@Query('country') country: string) {
     const items = await this.prisma.newsItem.findMany({
-      where: {
-        isActive: true,
-        OR: [{ country: 'both' }, ...(country ? [{ country }] : [])],
-      },
+      where: { isActive: true, OR: [{ country: 'both' }, ...(country ? [{ country }] : [])] },
       orderBy: [{ priority: 'desc' }, { publishedAt: 'desc' }],
     });
     return { success: true, data: items };
@@ -275,8 +334,7 @@ export class NewsController {
 
   @Get(':id')
   async findOne(@Param('id') id: string) {
-    const item = await this.prisma.newsItem.findUnique({ where: { id } });
-    return { success: true, data: item };
+    return { success: true, data: await this.prisma.newsItem.findUnique({ where: { id } }) };
   }
 }
 
@@ -284,20 +342,20 @@ export class NewsController {
 export class NewsModule {}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TOURISM MODULE (weather + currency proxy)
+// TOURISM MODULE
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Injectable()
 class TourismService {
   private ratesCache: any = null;
   private ratesCacheTime = 0;
-
   constructor(private config: ConfigService) {}
 
   async getRates() {
     if (this.ratesCache && Date.now() - this.ratesCacheTime < 30 * 60 * 1000) return this.ratesCache;
     try {
       const appId = this.config.get('OPEN_EXCHANGE_RATES_APP_ID');
+      if (!appId) throw new Error('No API key');
       const { data } = await axios.get(`https://openexchangerates.org/api/latest.json?app_id=${appId}&base=USD&symbols=NGN,JOD,IQD,GBP,EUR`);
       const ngnRate = data.rates.NGN;
       this.ratesCache = { base: 'NGN', rates: { JOD: data.rates.JOD / ngnRate, IQD: data.rates.IQD / ngnRate, USD: 1 / ngnRate, GBP: data.rates.GBP / ngnRate, EUR: data.rates.EUR / ngnRate }, timestamp: data.timestamp * 1000 };
@@ -311,6 +369,7 @@ class TourismService {
   async getWeather(city: string, country: string) {
     try {
       const apiKey = this.config.get('OPENWEATHER_API_KEY');
+      if (!apiKey) return null;
       const { data } = await axios.get(`https://api.openweathermap.org/data/2.5/weather?q=${city},${country}&appid=${apiKey}&units=metric`);
       return { city: data.name, country: data.sys.country, temp: data.main.temp, feelsLike: data.main.feels_like, condition: data.weather[0].description, conditionCode: data.weather[0].id, humidity: data.main.humidity, windKph: Math.round(data.wind.speed * 3.6) };
     } catch { return null; }
@@ -319,16 +378,10 @@ class TourismService {
 
 @ApiTags('Tourism')
 @Controller('tourism')
-export class TourismController {
+class TourismController {
   constructor(private service: TourismService) {}
-
-  @Get('rates')
-  async getRates() { return { success: true, data: await this.service.getRates() }; }
-
-  @Get('weather')
-  async getWeather(@Query('city') city: string, @Query('country') country: string) {
-    return { success: true, data: await this.service.getWeather(city, country) };
-  }
+  @Get('rates') async getRates() { return { success: true, data: await this.service.getRates() }; }
+  @Get('weather') async getWeather(@Query('city') city: string, @Query('country') country: string) { return { success: true, data: await this.service.getWeather(city, country) }; }
 }
 
 @Module({ controllers: [TourismController], providers: [TourismService] })
@@ -341,35 +394,22 @@ export class TourismModule {}
 @Injectable()
 class AppointmentsService {
   private readonly logger = new Logger(AppointmentsService.name);
-
   constructor(private prisma: PrismaService, private notifications: NotificationsService) {}
 
   async create(citizenId: string, dto: any) {
     const refNum = `NE-APT-${Date.now().toString(36).toUpperCase()}`;
     const scheduledDateTime = new Date(`${dto.scheduledDate}T${dto.scheduledTime}:00`);
-
     const appointment = await this.prisma.appointment.create({
       data: {
-        id: uuidv4(),
-        referenceNumber: refNum,
-        citizenId,
-        serviceType: dto.serviceType,
-        serviceLabel: dto.serviceLabel,
-        country: dto.country,
-        scheduledDate: scheduledDateTime,
-        scheduledTime: dto.scheduledTime,
-        notes: dto.notes,
-        location: dto.country === 'jordan'
-          ? 'Nigerian Embassy, 5th Circle, Amman, Jordan'
-          : 'Nigerian Embassy (Amman) — Iraq Remote Service',
+        id: uuidv4(), referenceNumber: refNum, citizenId,
+        serviceType: dto.serviceType, serviceLabel: dto.serviceLabel,
+        country: dto.country, scheduledDate: scheduledDateTime,
+        scheduledTime: dto.scheduledTime, notes: dto.notes,
+        location: dto.country === 'jordan' ? 'Nigerian Embassy, 5th Circle, Amman' : 'Nigerian Embassy (Amman) — Iraq Remote Service',
       },
     });
-
     const citizen = await this.prisma.citizen.findUnique({ where: { id: citizenId }, select: { fcmToken: true } });
-    if (citizen?.fcmToken) {
-      await this.notifications.sendToDevice(citizen.fcmToken, { title: '📅 Appointment Confirmed', body: `${dto.serviceLabel} — ${dto.scheduledDate} at ${dto.scheduledTime}` });
-    }
-
+    if (citizen?.fcmToken) await this.notifications.sendToDevice(citizen.fcmToken, { title: '📅 Appointment Confirmed', body: `${dto.serviceLabel} — ${dto.scheduledDate} at ${dto.scheduledTime}` });
     return appointment;
   }
 
@@ -380,57 +420,20 @@ class AppointmentsService {
   async update(id: string, dto: any) {
     return this.prisma.appointment.update({ where: { id }, data: { status: dto.status, notes: dto.notes } });
   }
-
-  @Cron(CronExpression.EVERY_DAY_AT_9AM)
-  async sendDueReminders() {
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const start = new Date(tomorrow); start.setHours(0, 0, 0, 0);
-    const end = new Date(tomorrow); end.setHours(23, 59, 59, 999);
-
-    const appointments = await this.prisma.appointment.findMany({
-      where: { scheduledDate: { gte: start, lte: end }, status: { in: ['scheduled', 'confirmed'] }, reminderSent: false },
-      include: { citizen: { select: { fcmToken: true, email: true, firstName: true } } },
-    });
-
-    for (const appt of appointments) {
-      if (appt.citizen.fcmToken) {
-        await this.notifications.sendToDevice(appt.citizen.fcmToken, {
-          title: '📅 Appointment Tomorrow',
-          body: `${appt.serviceLabel} — ${appt.scheduledTime}`,
-        });
-      }
-      await this.prisma.appointment.update({ where: { id: appt.id }, data: { reminderSent: true } });
-    }
-    this.logger.log(`Sent ${appointments.length} appointment reminders`);
-  }
 }
 
 @ApiTags('Appointments')
 @UseGuards(JwtAuthGuard)
 @ApiBearerAuth()
 @Controller('appointments')
-export class AppointmentsController {
+class AppointmentsController {
   constructor(private service: AppointmentsService) {}
-
-  @Post()
-  @HttpCode(HttpStatus.CREATED)
-  async create(@Request() req: any, @Body() dto: any) {
-    return { success: true, data: await this.service.create(req.user.id, dto) };
-  }
-
-  @Get()
-  async findAll(@Request() req: any) {
-    return { success: true, data: await this.service.findByCitizen(req.user.id) };
-  }
-
-  @Patch(':id')
-  async update(@Param('id') id: string, @Body() dto: any) {
-    return { success: true, data: await this.service.update(id, dto) };
-  }
+  @Post() @HttpCode(HttpStatus.CREATED) async create(@Request() req: any, @Body() dto: any) { return { success: true, data: await this.service.create(req.user.id, dto) }; }
+  @Get() async findAll(@Request() req: any) { return { success: true, data: await this.service.findByCitizen(req.user.id) }; }
+  @Patch(':id') async update(@Param('id') id: string, @Body() dto: any) { return { success: true, data: await this.service.update(id, dto) }; }
 }
 
-@Module({ controllers: [AppointmentsController], providers: [AppointmentsService, PrismaService] })
+@Module({ imports: [NotificationsModule], controllers: [AppointmentsController], providers: [AppointmentsService, PrismaService], exports: [AppointmentsService] })
 export class AppointmentsModule {}
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -441,7 +444,7 @@ export class AppointmentsModule {}
 @UseGuards(JwtAuthGuard)
 @ApiBearerAuth()
 @Controller('citizens')
-export class CitizensController {
+class CitizensController {
   constructor(private prisma: PrismaService) {}
 
   @Get('me')
