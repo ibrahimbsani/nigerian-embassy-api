@@ -1,11 +1,11 @@
 [phases.setup]
-nixPkgs = ["nodejs_18"]
-
-[phases.install]
-cmds = ["npm install"]
+nixPkgs = ["nodejs_18", "npm-9_x"]
 
 [phases.build]
-cmds = ["npx prisma generate", "npx nest build"]
+cmds = [
+  "npm install --include=dev",
+  "npx prisma generate"
+]
 
 [start]
-cmd = "npx prisma migrate deploy && node dist/main"
+cmd = "npm run build && npx prisma db push --accept-data-loss && node dist/main"
